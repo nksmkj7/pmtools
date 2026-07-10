@@ -1,0 +1,1091 @@
+openapi: 3.0.3
+info:
+  title: PM Tools Integration API
+  version: 1.0.0
+  description: |
+    A single unified REST API that sits in front of multiple project management
+    tools (currently **Jira** and **ClickUp**) behind one shared contract. Every
+    route is namespaced by `{provider}` (`jira` or `clickup`) so callers use the
+    exact same endpoint shape regardless of which underlying tool actually holds
+    the ticket.
+
+    ## How to pick the right route (read this first)
+
+    This section exists specifically to help an LLM or automated agent choose
+    the correct endpoint without trial and error:
+
+    1. **You almost never need to guess IDs.** If you don't already have a
+       `ticketId` or a `projectKeyOrListId`, call `GET /api/{provider}/containers`
+       first to discover valid project/list IDs, or ask the user for the ticket
+       ID/key they mean.
+    2. **"Show me a ticket" / "what does this ticket say" / "get ticket details
+       and discussion"** → use `GET /api/{provider}/tickets/{ticketId}`. It
+       returns the ticket AND its comments in one call. This is the right
+       default for almost every "look up a ticket" request.
+    3. **"Get just the ticket fields, I don't care about comments"** (e.g. you
+       only need status/assignee/priority and want a smaller, faster response)
+       → use `GET /api/{provider}/tickets/{ticketId}/details` instead. Do not
+       use this if the user's request implies they want to read discussion,
+       history, or replies — use the combined endpoint above for that.
+    4. **"What are the comments / replies / discussion on this ticket"** →
+       `GET /api/{provider}/tickets/{ticketId}/comments`. Use this instead of
+       the combined ticket endpoint only when you specifically do NOT need the
+       ticket's own fields (title/status/etc.), e.g. summarizing just the
+       conversation.
+    5. **"Add a comment / reply / note to this ticket"** →
+       `POST /api/{provider}/tickets/{ticketId}/comments`. This does not
+       change ticket status or fields — for that use the update or status
+       routes below.
+    6. **"Create a new ticket / bug / task / issue"** →
+       `POST /api/{provider}/tickets`. Requires `projectKeyOrListId` — if you
+       don't know it, call `GET /api/{provider}/containers` first to find the
+       right Jira project key or ClickUp list ID and confirm it with the user
+       if there is any ambiguity (more than one plausible project/list).
+    7. **"Update the title/description/assignee/priority of a ticket"** →
+       `PATCH /api/{provider}/tickets/{ticketId}`. Do NOT use this to change
+       status/workflow state — statuses are transition-controlled (especially
+       in Jira) and have a dedicated pair of routes (see next points).
+    8. **"What statuses can this ticket move to" / "what are the valid
+       columns/states"** → `GET /api/{provider}/tickets/{ticketId}/statuses`.
+       Always call this before attempting a status change if you are not
+       certain the target status name is valid for this specific ticket/board
+       — Jira statuses are workflow-specific per issue, and ClickUp statuses
+       are list-specific, so a status valid on one ticket may not exist on
+       another.
+    9. **"Move this ticket to <status>" / "mark it done/in progress/closed"**
+       → `PATCH /api/{provider}/tickets/{ticketId}/status` with
+       `{ "status": "<name or id from the statuses route>" }`.
+    10. **"Delete/remove this ticket"** →
+        `DELETE /api/{provider}/tickets/{ticketId}`. This is destructive and
+        irreversible in both Jira and ClickUp — only call it when the user has
+        explicitly and unambiguously asked to delete a specific ticket by
+        ID/key, never as a side effect of another request.
+    11. **"What projects/lists do we have access to" / "where can I create a
+        ticket" / "I don't know the list ID"** →
+        `GET /api/{provider}/containers`. This is the discovery endpoint for
+        the value you put in `projectKeyOrListId` when creating a ticket. Use
+        this, not the boards route below, when the goal is to create a ticket.
+    12. **"List the Jira/ClickUp boards" / "what Scrum/Kanban boards exist" /
+        "show me the board for project X"** → `GET /api/{provider}/boards`.
+        This is a *different* concept from containers, even though they
+        overlap for ClickUp — see the table below. Use containers (not
+        boards) when the goal is picking a `projectKeyOrListId` to create a
+        ticket in; use boards when the user is specifically asking about
+        Scrum/Kanban boards or board-style views.
+
+    ## Provider differences you must account for
+
+    | Concept | Jira | ClickUp |
+    |---|---|---|
+    | `provider` path value | `jira` | `clickup` |
+    | `ticketId` path value | Issue key (e.g. `WEB-84`) or numeric issue ID | Task ID (e.g. `86a71dmab`) |
+    | `projectKeyOrListId` (create) | Project key (e.g. `WEB`) | List ID (e.g. `901307807729`) |
+    | Status changes | Restricted by workflow transitions — not every status is reachable from every other status | Any status defined on the task's list is settable directly |
+    | Comment/description formatting | Plain text in/out; internally stored as Atlassian Document Format (ADF) and converted automatically by this API | Plain text |
+    | Containers vs. boards | A **project** (container) can have zero, one, or several Agile **boards** attached — they are distinct entities with different IDs (`GET /api/jira/containers` returns project keys; `GET /api/jira/boards` returns numeric board IDs plus which project each belongs to via `projectKeyOrListId`) | A **list** is simultaneously its own container AND its own board (ClickUp has no separate board entity) — `GET /api/clickup/containers` and `GET /api/clickup/boards` return the same set of IDs, just with `type: "list"` added on the boards route |
+
+    Because of the workflow-transition restriction on Jira, always check
+    `GET /api/{provider}/tickets/{ticketId}/statuses` before calling the status
+    update route if you're not certain the destination status is reachable —
+    the update route will return a 400 if the status name/id you send isn't in
+    that list.
+
+    ## Authentication
+
+    This API itself does not require a client-supplied token. It authenticates
+    to the underlying tool using server-side credentials configured via
+    environment variables (`JIRA_*`, `CLICKUP_*`). Callers only ever choose a
+    `provider`, never a credential.
+
+    ## Error shape
+
+    All error responses (4xx/5xx) share this shape:
+    ```json
+    { "error": "human readable message", "provider": "jira" }
+    ```
+    A `404` on any `/tickets/{ticketId}...` route means the ticket does not
+    exist (or is not accessible) in that provider — it does NOT necessarily
+    mean it doesn't exist at all; it may exist in the *other* provider instead.
+    If a lookup 404s, consider retrying with the other provider before telling
+    the user the ticket doesn't exist, if you don't already know which
+    provider it lives in.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: http://localhost:3000/api
+    description: Local development (API root — most paths below are relative to this)
+
+tags:
+  - name: Health
+    description: Liveness/readiness check for the service itself. Not related to any PM tool.
+  - name: Discovery
+    description: >-
+      Routes for finding valid IDs (projects/lists) before creating or looking
+      up tickets. Call these when you don't already have a concrete ID.
+  - name: Tickets
+    description: >-
+      Core ticket lifecycle — read, create, update, delete. Use the route
+      guidance in the top-level description to pick the right one; several of
+      these look similar but return different amounts of data or have
+      different side effects.
+  - name: Comments
+    description: Reading and adding ticket comments/discussion, independent of the ticket's own fields.
+  - name: Status
+    description: >-
+      Discovering and changing a ticket's workflow status. Kept separate from
+      the general update route because status changes are transition-gated in
+      Jira and have very different semantics from editing a field like title
+      or description.
+  - name: Lists
+    description: >-
+      Attaching/detaching a ticket to an additional list, independent of its
+      primary list. **ClickUp-only** — Jira has no equivalent concept since a
+      Jira issue always belongs to exactly one project; calling these routes
+      with `provider=jira` returns a 400.
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Service liveness check
+      description: >-
+        Returns 200 if the API process itself is up. Does NOT verify
+        connectivity to Jira or ClickUp — a 200 here says nothing about
+        whether ticket routes will succeed. Use this only for infrastructure
+        health checks (load balancers, container orchestration), not to
+        validate that a specific provider's credentials work.
+      responses:
+        '200':
+          description: Service is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/{provider}/containers:
+    get:
+      tags: [Discovery]
+      operationId: getContainers
+      summary: List the projects (Jira) or lists (ClickUp) tickets can be created in
+      description: >-
+        Use this route whenever you need a value for `projectKeyOrListId` to
+        pass to `POST /api/{provider}/tickets`, or when the user asks "what
+        projects/lists do we have" or "where should this ticket go". Every
+        item's `id` field is exactly what you should pass back as
+        `projectKeyOrListId`. If the user is asking about Scrum/Kanban
+        boards specifically rather than where to file a ticket, use
+        `GET /api/{provider}/boards` instead.
+
+
+        For **Jira**, each item represents one project (`id` is the project
+        key, e.g. `WEB`). For **ClickUp**, each item represents one list,
+        flattened out of the team → space → folder → list hierarchy, with
+        `path` showing that hierarchy for disambiguation (e.g. two lists
+        named "Bugs" in different spaces will have different `path` values).
+
+
+        This call can be slow for ClickUp (it walks every space and folder in
+        the workspace) — avoid calling it more than once per conversation
+        turn; cache the result if you need to look up multiple containers.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+      responses:
+        '200':
+          description: List of containers (projects/lists) available to the configured credentials.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TicketContainer'
+              examples:
+                jira:
+                  summary: Jira projects
+                  value:
+                    - id: WEB
+                      name: MedEx.co
+                    - id: MOB
+                      name: MedEx Mobile
+                clickup:
+                  summary: ClickUp lists
+                  value:
+                    - id: '901307807729'
+                      name: QuickBugFixes | Bipin
+                      path: Current Core Dev / Projects
+                    - id: '901313616559'
+                      name: Bugs
+                      path: Reseller Portal Bugs
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/boards:
+    get:
+      tags: [Discovery]
+      operationId: getBoards
+      summary: List Scrum/Kanban boards (Jira) or board-viewable lists (ClickUp)
+      description: >-
+        Use this for "what boards do we have", "show me the Scrum/Kanban
+        board for project X", or anything specifically about Agile
+        board-style views — NOT for finding a `projectKeyOrListId` to create
+        a ticket in (use `GET /api/{provider}/containers` for that instead;
+        see the containers-vs-boards comparison in the top-level API
+        description).
+
+
+        For **Jira**, this calls the Agile REST API and returns real Scrum/
+        Kanban board entities, each with a numeric `id` distinct from its
+        project's key, plus `type` (`scrum`/`kanban`/`simple`) and
+        `projectKeyOrListId` identifying which project it's attached to. A
+        single project can have zero, one, or multiple boards, and a board's
+        `id` is NOT usable as `projectKeyOrListId` when creating a ticket —
+        use the `projectKeyOrListId` field on the board object for that, or
+        just call the containers route directly.
+
+
+        For **ClickUp**, there is no separate board entity — every list is
+        viewable as a board — so this returns the same lists as the
+        containers route, each tagged `type: "list"`, and its `id` IS
+        directly usable as `projectKeyOrListId` (in ClickUp's case,
+        `id` and `projectKeyOrListId` on each item are identical).
+
+
+        Like the containers route, this can be slow for ClickUp since it
+        walks the full space/folder hierarchy — avoid redundant calls within
+        a conversation turn.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+      responses:
+        '200':
+          description: Boards available to the configured credentials.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Board'
+              examples:
+                jira:
+                  summary: Jira Agile boards
+                  value:
+                    - id: '38'
+                      name: MDC board
+                      type: simple
+                      projectKeyOrListId: WEB
+                    - id: '173'
+                      name: OP board
+                      type: scrum
+                      projectKeyOrListId: OP
+                clickup:
+                  summary: ClickUp lists in board view
+                  value:
+                    - id: '901307807729'
+                      name: QuickBugFixes | Bipin
+                      type: list
+                      projectKeyOrListId: '901307807729'
+                      path: Current Core Dev / Projects
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/users:
+    get:
+      tags: [Tickets]
+      operationId: getUsers
+      summary: Search assignable users
+      description: >-
+        Use to resolve a user's `id` before setting `assignee` on a
+        create/update ticket request — never guess or hardcode an account
+        ID. Optional `query` filters by name/email substring; omit it to
+        list all users (ClickUp) or get an empty-query search (Jira).
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - name: query
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Name or email substring to filter users by.
+      responses:
+        '200':
+          description: Users matching the query.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PMUser'
+              examples:
+                jira:
+                  summary: Jira user search
+                  value:
+                    - id: '712020:a69b12f6-0f72-4a00-8283-ba9aa0fb01e5'
+                      name: Nikesh Makaju
+                      email: nikesh.m@medex.co.th
+                clickup:
+                  summary: ClickUp team member search
+                  value:
+                    - id: '118050764'
+                      name: nikesh
+                      email: n.makaju@a5sync.com
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets:
+    post:
+      tags: [Tickets]
+      operationId: createTicket
+      summary: Create a new ticket
+      description: >-
+        Use for "create a bug/task/issue/story" requests. Requires
+        `projectKeyOrListId` — if the user hasn't specified which
+        project/list, and there is any ambiguity, call
+        `GET /api/{provider}/containers` first and confirm the target with the
+        user rather than guessing. On success returns the full created ticket
+        (equivalent shape to the "details" route, not the combined
+        with-comments shape, since a brand-new ticket has no comments yet).
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTicketInput'
+            examples:
+              jira:
+                summary: Create a Jira issue in project WEB
+                value:
+                  title: Fix checkout flow for logged in case
+                  description: Guest checkout works; logged-in checkout is broken.
+                  projectKeyOrListId: WEB
+                  priority: High
+              clickup:
+                summary: Create a ClickUp task in a specific list
+                value:
+                  title: Fix checkout flow for logged in case
+                  description: Guest checkout works; logged-in checkout is broken.
+                  projectKeyOrListId: '901307807729'
+                  priority: urgent
+              jira-subtask:
+                summary: Create a Jira sub-task under issue WEB-123
+                value:
+                  title: Write regression test for checkout fix
+                  description: Cover the logged-in checkout path.
+                  projectKeyOrListId: WEB
+                  parentId: WEB-123
+              clickup-subtask:
+                summary: Create a ClickUp subtask under an existing task
+                value:
+                  title: Write regression test for checkout fix
+                  description: Cover the logged-in checkout path.
+                  projectKeyOrListId: '901307807729'
+                  parentId: '86b3xyz123'
+      responses:
+        '201':
+          description: Ticket created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '400':
+          description: >-
+            Missing/invalid `projectKeyOrListId`, unsupported provider, or the
+            underlying tool rejected the payload (e.g. unknown project key,
+            unknown list ID, or invalid priority value for that provider).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets/{ticketId}:
+    get:
+      tags: [Tickets]
+      operationId: getTicketWithComments
+      summary: Get a ticket AND its comments in one call (default "show me this ticket" route)
+      description: >-
+        This is the route to use for the general case of "show me ticket X",
+        "what's the status of X", "summarize this ticket", "what's the
+        discussion on X" — anything where the user wants to see or reason
+        about a ticket. It returns everything `GET .../details` returns, plus
+        a `comments` array, in a single round trip. Prefer this over calling
+        `.../details` and `.../comments` separately unless you have a specific
+        reason to fetch only one of the two (e.g. performance-sensitive bulk
+        fetch of many tickets where comments aren't needed — use `.../details`
+        for that case instead).
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      responses:
+        '200':
+          description: Ticket with its comments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketWithComments'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+    patch:
+      tags: [Tickets]
+      operationId: updateTicket
+      summary: Update ticket fields (title, description, assignee, priority)
+      description: >-
+        Use for "rename this ticket", "update the description", "reassign
+        this to X", "change priority to Y". All fields are optional — only
+        send the ones you want to change; omitted fields are left untouched.
+
+        Do NOT use this route to change ticket status/workflow state — send
+        only field edits here. For status changes use
+        `PATCH /api/{provider}/tickets/{ticketId}/status` instead, since
+        status is transition-gated (especially in Jira) and handled
+        separately from arbitrary field edits.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTicketInput'
+            examples:
+              reassignAndReprioritize:
+                summary: Change assignee and priority only
+                value:
+                  assignee: jane.doe
+                  priority: High
+      responses:
+        '200':
+          description: Updated ticket (fields only — no comments; call the GET route if you need those too).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+    delete:
+      tags: [Tickets]
+      operationId: deleteTicket
+      summary: Permanently delete a ticket
+      description: >-
+        DESTRUCTIVE AND IRREVERSIBLE in both Jira and ClickUp — there is no
+        "undo" or trash/recycle-bin step exposed by this API. Only call this
+        when the user has explicitly and specifically asked to delete a named
+        ticket by ID/key. Never call this to "clean up" or as a guess when a
+        create/update fails. If there's any doubt about which ticket the user
+        means, confirm the exact ticket ID/key before calling this route.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      responses:
+        '204':
+          description: Ticket deleted. No response body.
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets/{ticketId}/details:
+    get:
+      tags: [Tickets]
+      operationId: getTicket
+      summary: Get ticket fields only, WITHOUT comments (lighter/faster than the combined route)
+      description: >-
+        Returns the same ticket fields as `GET /api/{provider}/tickets/{ticketId}`
+        but skips fetching comments — use this when you explicitly don't need
+        discussion/comments (e.g. bulk-checking status/assignee across many
+        tickets, or when you know the user only cares about a specific field
+        like status or priority). If there is any chance the user wants to
+        see discussion/history, use the combined
+        `GET /api/{provider}/tickets/{ticketId}` route instead — don't use
+        this route as your default.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      responses:
+        '200':
+          description: Ticket fields, no comments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets/{ticketId}/comments:
+    get:
+      tags: [Comments]
+      operationId: getComments
+      summary: List a ticket's comments only (no ticket fields)
+      description: >-
+        Use only when you specifically need just the discussion/comment
+        thread and not the ticket's own fields (title/status/etc.) — e.g.
+        "summarize the conversation on this ticket" without also needing its
+        metadata. If you need both, prefer the combined
+        `GET /api/{provider}/tickets/{ticketId}` route to save a round trip.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      responses:
+        '200':
+          description: List of comments, oldest first as returned by the underlying provider.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TicketComment'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+    post:
+      tags: [Comments]
+      operationId: addComment
+      summary: Add a comment to a ticket
+      description: >-
+        Use for "add a comment/note/reply to this ticket", "post an update on
+        X". This only adds to the discussion thread — it does not change the
+        ticket's status or any other field. To also change status, make a
+        separate call to the status route.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommentInput'
+            examples:
+              default:
+                value:
+                  body: Verified the fix in staging — looks good to ship.
+      responses:
+        '201':
+          description: Comment created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketComment'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets/{ticketId}/statuses:
+    get:
+      tags: [Status]
+      operationId: getAvailableStatuses
+      summary: List the statuses this specific ticket can currently move to
+      description: >-
+        ALWAYS call this before `PATCH /api/{provider}/tickets/{ticketId}/status`
+        if you are not 100% certain the target status name/id is valid for
+        this exact ticket. The result is ticket-specific, not just
+        provider-wide:
+
+        - In **Jira**, this returns the workflow *transitions* currently
+          available from the ticket's current status — not every status in
+          the project's workflow is reachable from every other status, so the
+          same issue type in the same project can have different available
+          transitions depending on its current state.
+        - In **ClickUp**, this returns every status defined on the ticket's
+          list (ClickUp lets you jump to any status directly, no transition
+          graph), so the result only depends on which list the task is in.
+
+        Each returned item's `id` or `name` can be used as the `status` value
+        in the status-update request body.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      responses:
+        '200':
+          description: Statuses/transitions available for this ticket right now.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TicketStatus'
+              examples:
+                jira:
+                  summary: Available Jira transitions from "In Progress"
+                  value:
+                    - id: '4'
+                      name: IN QA
+                    - id: '2'
+                      name: CLOSE
+                clickup:
+                  summary: All statuses on the ClickUp task's list
+                  value:
+                    - id: p90132474781_DCnaeiSB
+                      name: to do
+                      category: open
+                    - id: p90132474781_g9uxhsQM
+                      name: in progress
+                      category: custom
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets/{ticketId}/status:
+    patch:
+      tags: [Status]
+      operationId: updateStatus
+      summary: Move a ticket to a different status
+      description: >-
+        Use for "mark this done", "move to in progress", "close this ticket".
+        The `status` value must match a `name` or `id` returned by
+        `GET /api/{provider}/tickets/{ticketId}/statuses` for this same
+        ticket — sending an arbitrary string will return a 400, since Jira
+        transitions and ClickUp list statuses are both constrained sets, not
+        free text. Matching is case-insensitive on `name`.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  description: A status `name` or `id` from the statuses route for this ticket.
+                  example: In Progress
+      responses:
+        '200':
+          description: Ticket after the status change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '400':
+          description: >-
+            Unsupported provider, or `status` does not match any value
+            returned by the statuses route for this ticket (invalid Jira
+            transition or unknown ClickUp status name).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets/{ticketId}/lists/{listId}:
+    post:
+      tags: [Lists]
+      operationId: addTaskToList
+      summary: 'ClickUp-only: attach an existing task to an additional list'
+      description: >-
+        Adds the task to `listId` without removing it from its current
+        list(s) — this is ClickUp's "Tasks in Multiple Lists" feature. Not
+        supported by Jira (an issue can only belong to one project); calling
+        this with `provider=jira` returns a 400 `FeatureNotSupportedError`
+        instead of reaching the Jira API.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+        - name: listId
+          in: path
+          required: true
+          description: The ClickUp list ID to attach the task to.
+          schema:
+            type: string
+          example: '987654321'
+      responses:
+        '200':
+          description: The task, now also a member of the given list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '400':
+          description: Unsupported provider, or the feature is not supported by this provider (e.g. Jira).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+    delete:
+      tags: [Lists]
+      operationId: removeTaskFromList
+      summary: 'ClickUp-only: detach a task from one of its lists'
+      description: >-
+        Removes the task from `listId` only — it remains in any other list(s)
+        it's attached to. Not supported by Jira; calling this with
+        `provider=jira` returns a 400 `FeatureNotSupportedError`.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+        - name: listId
+          in: path
+          required: true
+          description: The ClickUp list ID to detach the task from.
+          schema:
+            type: string
+          example: '987654321'
+      responses:
+        '204':
+          description: Task removed from the list.
+        '400':
+          description: Unsupported provider, or the feature is not supported by this provider (e.g. Jira).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+components:
+  parameters:
+    ProviderParam:
+      name: provider
+      in: path
+      required: true
+      description: >-
+        Which PM tool to talk to. Must be exactly `jira` or `clickup` — any
+        other value returns a 400 before any provider call is made.
+      schema:
+        type: string
+        enum: [jira, clickup]
+      example: jira
+
+    TicketIdParam:
+      name: ticketId
+      in: path
+      required: true
+      description: >-
+        The provider-native ticket identifier. For Jira this is the issue key
+        (e.g. `WEB-84`) or numeric issue ID — either works. For ClickUp this
+        is the task ID (e.g. `86a71dmab`). Do not use a title or summary text
+        here — only an actual ID/key.
+      schema:
+        type: string
+      examples:
+        jira:
+          value: WEB-84
+        clickup:
+          value: 86a71dmab
+
+  responses:
+    BadProvider:
+      description: >-
+        `provider` path segment was not `jira` or `clickup`. Returned before
+        any request reaches the underlying tool.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: 'Unsupported provider "foo". Supported providers: jira, clickup'
+
+    TicketNotFound:
+      description: >-
+        No ticket with this ID/key exists in this provider (or it exists but
+        is not visible to the configured credentials). Consider that the
+        ticket may exist under the *other* provider instead if you're not
+        sure which system it's in.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: '[jira] Ticket "WEB-9999" not found'
+            provider: jira
+
+    ProviderError:
+      description: >-
+        The underlying Jira/ClickUp API call failed for a reason other than
+        "not found" (auth failure, rate limit, malformed request the provider
+        rejected, network error, etc). Check `error` for the underlying
+        message.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Human-readable error message, already prefixed with `[provider]` where applicable.
+        provider:
+          type: string
+          enum: [jira, clickup]
+          description: Present when the error originated from a specific provider call.
+      example:
+        error: '[clickup] getTicket failed: Request failed with status code 401'
+        provider: clickup
+
+    TicketStatus:
+      type: object
+      description: A single status or workflow transition a ticket can be in or move to.
+      properties:
+        id:
+          type: string
+          description: Provider-native status/transition ID. Usable as the `status` value when updating status.
+        name:
+          type: string
+          description: Human-readable status name. Also usable as the `status` value when updating status (case-insensitive match).
+        category:
+          type: string
+          description: >-
+            Coarse-grained bucket for the status — Jira status category key
+            (`new` / `indeterminate` / `done`) or ClickUp status type
+            (`open` / `custom` / `closed`). Useful for grouping/coloring
+            statuses without knowing every provider-specific name.
+      required: [id, name]
+
+    TicketComment:
+      type: object
+      description: A single comment/reply on a ticket, normalized across providers.
+      properties:
+        id:
+          type: string
+        author:
+          type: string
+          description: Display name of the comment author.
+        body:
+          type: string
+          description: Plain-text comment body (Jira's rich ADF format is already converted to plain text here).
+        createdAt:
+          type: string
+          description: ISO-8601-ish timestamp as returned by the provider (format varies slightly by provider).
+        updatedAt:
+          type: string
+      required: [id, author, body, createdAt]
+
+    TicketContainer:
+      type: object
+      description: >-
+        A place a ticket can be created — a Jira project or a ClickUp list.
+        Returned by the discovery endpoint; `id` is what you pass as
+        `projectKeyOrListId` when creating a ticket.
+      properties:
+        id:
+          type: string
+          description: Jira project key, or ClickUp list ID. Use verbatim as `projectKeyOrListId`.
+        name:
+          type: string
+          description: Human-readable project/list name.
+        path:
+          type: string
+          description: >-
+            ClickUp only — the space/folder hierarchy this list lives under,
+            useful for disambiguating same-named lists in different spaces.
+            Not present for Jira.
+      required: [id, name]
+
+    Board:
+      type: object
+      description: >-
+        A Scrum/Kanban-style board over tickets. Distinct from
+        `TicketContainer` for Jira (a board's `id` is a separate numeric
+        Agile-board ID, not a project key) but effectively identical to it
+        for ClickUp (every list is its own board). See the
+        containers-vs-boards comparison table in the top-level API
+        description before choosing between `/containers` and `/boards`.
+      properties:
+        id:
+          type: string
+          description: >-
+            Jira: numeric Agile board ID (NOT a project key — do not use this
+            as `projectKeyOrListId`). ClickUp: list ID, identical to
+            `projectKeyOrListId` on this same object.
+        name:
+          type: string
+        type:
+          type: string
+          description: Jira board style (`scrum` / `kanban` / `simple`), or the literal `list` for every ClickUp entry.
+        projectKeyOrListId:
+          type: string
+          description: >-
+            The container this board is attached to — Jira project key the
+            board belongs to, or (for ClickUp) the same list ID as `id`. Use
+            THIS field, not `id`, as `projectKeyOrListId` when creating a
+            ticket for the project/list behind this board.
+        path:
+          type: string
+          description: ClickUp only — space/folder hierarchy, same meaning as on `TicketContainer`.
+      required: [id, name]
+
+    PMUser:
+      type: object
+      description: >-
+        A user who can be assigned tickets. Use `id` verbatim as the
+        `assignee` field on create/update ticket requests.
+      properties:
+        id:
+          type: string
+          description: Jira account ID, or ClickUp numeric user ID (as a string). Use as `assignee`.
+        name:
+          type: string
+          description: Display name / username.
+        email:
+          type: string
+          description: Email address, when available.
+      required: [id, name]
+
+    Ticket:
+      type: object
+      description: >-
+        A ticket normalized to a common shape regardless of provider. `raw`
+        preserves the full untouched provider response for any field not
+        promoted to the top level.
+      properties:
+        id:
+          type: string
+          description: Provider-internal numeric/opaque ID (distinct from the human-facing key for Jira).
+        key:
+          type: string
+          description: Human-facing identifier — Jira issue key (e.g. `WEB-84`) or ClickUp custom ID/task ID.
+        title:
+          type: string
+        description:
+          type: string
+          description: Plain-text description (Jira ADF already decoded to plain text).
+        status:
+          $ref: '#/components/schemas/TicketStatus'
+        assignee:
+          type: string
+          description: Display name(s) of assignee(s). ClickUp tasks can have multiple assignees joined by comma.
+        reporter:
+          type: string
+          description: Jira only — the user who created/reported the issue.
+        priority:
+          type: string
+        url:
+          type: string
+          description: ClickUp only — direct web link to the task.
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        raw:
+          description: Full, unmodified provider API response for this ticket — use for any field not surfaced above.
+      required: [id, key, title, description, status]
+
+    TicketWithComments:
+      allOf:
+        - $ref: '#/components/schemas/Ticket'
+        - type: object
+          properties:
+            comments:
+              type: array
+              items:
+                $ref: '#/components/schemas/TicketComment'
+          required: [comments]
+
+    CreateTicketInput:
+      type: object
+      description: Body for creating a new ticket. Extra provider-specific fields are passed through untouched.
+      properties:
+        title:
+          type: string
+          description: Ticket title/summary. Required.
+        description:
+          type: string
+          description: Plain-text ticket description. Optional but recommended.
+        projectKeyOrListId:
+          type: string
+          description: >-
+            Required. Jira project key (e.g. `WEB`) or ClickUp list ID (e.g.
+            `901307807729`). Get valid values from
+            `GET /api/{provider}/containers` if unknown.
+        assignee:
+          type: string
+          description: Jira only in the current implementation — Jira account ID of the assignee.
+        priority:
+          type: string
+          description: >-
+            Provider-specific priority name — Jira examples: `Highest`,
+            `High`, `Medium`, `Low`, `Lowest`. ClickUp examples: `urgent`,
+            `high`, `normal`, `low`.
+        status:
+          type: string
+          description: ClickUp only — initial status name for the new task (defaults to the list's default status if omitted).
+        parentId:
+          type: string
+          description: >-
+            Set to create this ticket as a subtask of an existing ticket.
+            Jira: the parent issue key (e.g. `WEB-123`) — the new issue is
+            created with issue type `Sub-task` unless `issueType` is also
+            given. ClickUp: the parent task ID — `projectKeyOrListId` must
+            still be the list the parent task lives in.
+      required: [title, projectKeyOrListId]
+
+    UpdateTicketInput:
+      type: object
+      description: >-
+        Body for updating ticket fields. All properties optional — send only
+        what should change. Does not include `status`; use the dedicated
+        status route for that.
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        assignee:
+          type: string
+          description: Jira only in the current implementation — Jira account ID of the assignee.
+        priority:
+          type: string
+
+    CreateCommentInput:
+      type: object
+      properties:
+        body:
+          type: string
+          description: Plain-text comment body. Required.
+        author:
+          type: string
+          description: Currently unused by both providers (comment author is always the authenticated API user) — accepted for forward compatibility only.
+      required: [body]

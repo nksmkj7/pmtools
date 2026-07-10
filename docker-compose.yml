@@ -1,0 +1,18 @@
+services:
+  pm-tools-api:
+    build: .
+    image: pm-tools-integration:latest
+    container_name: pm-tools-api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      HOST_PORT: ${PORT:-3000}
+      JIRA_BASE_URL: ${JIRA_BASE_URL}
+      JIRA_EMAIL: ${JIRA_EMAIL}
+      JIRA_API_TOKEN: ${JIRA_API_TOKEN}
+      CLICKUP_BASE_URL: ${CLICKUP_BASE_URL:-https://api.clickup.com}
+      CLICKUP_API_TOKEN: ${CLICKUP_API_TOKEN}
+    env_file:
+      - .env
