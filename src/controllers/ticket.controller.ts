@@ -116,6 +116,20 @@ export const ticketController = {
     }
   },
 
+  async searchTickets(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { projectKeyOrListId, status } = req.query as { projectKeyOrListId?: string; status?: string };
+      if (!projectKeyOrListId) {
+        res.status(400).json({ message: 'projectKeyOrListId query param is required' });
+        return;
+      }
+      const tickets = await getProvider(req).searchTickets(projectKeyOrListId, status);
+      res.json(tickets);
+    } catch (err) {
+      next(err);
+    }
+  },
+
   async addTaskToList(req: Request, res: Response, next: NextFunction) {
     try {
       const provider = getProvider(req);
@@ -137,6 +151,75 @@ export const ticketController = {
       }
       await provider.removeTaskFromList(req.params.ticketId, req.params.listId);
       res.status(204).send();
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async getWorkspaces(req: Request, res: Response, next: NextFunction) {
+    try {
+      const provider = getProvider(req);
+      if (!provider.getWorkspaces) {
+        throw new FeatureNotSupportedError(provider.providerName, 'getWorkspaces');
+      }
+      const workspaces = await provider.getWorkspaces();
+      res.json(workspaces);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async searchDocs(req: Request, res: Response, next: NextFunction) {
+    try {
+      const provider = getProvider(req);
+      if (!provider.searchDocs) {
+        throw new FeatureNotSupportedError(provider.providerName, 'searchDocs');
+      }
+      const { containerId } = req.query as { containerId?: string };
+      if (!containerId) {
+        res.status(400).json({ message: 'containerId query param is required' });
+        return;
+      }
+      const docs = await provider.searchDocs(containerId);
+      res.json(docs);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async getDoc(req: Request, res: Response, next: NextFunction) {
+    try {
+      const provider = getProvider(req);
+      if (!provider.getDoc) {
+        throw new FeatureNotSupportedError(provider.providerName, 'getDoc');
+      }
+      const doc = await provider.getDoc(req.params.docId, req.query.containerId as string | undefined);
+      res.json(doc);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async getDocPages(req: Request, res: Response, next: NextFunction) {
+    try {
+      const provider = getProvider(req);
+      if (!provider.getDocPages) {
+        throw new FeatureNotSupportedError(provider.providerName, 'getDocPages');
+      }
+      const pages = await provider.getDocPages(req.params.docId, req.query.containerId as string | undefined);
+      res.json(pages);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async getDocWithPages(req: Request, res: Response, next: NextFunction) {
+    try {
+      const doc = await getProvider(req).getDocWithPages(
+        req.params.docId,
+        req.query.containerId as string | undefined,
+      );
+      res.json(doc);
     } catch (err) {
       next(err);
     }

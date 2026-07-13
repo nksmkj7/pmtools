@@ -1,5 +1,6 @@
 import { BasePMToolProvider } from '../abstract/BasePMToolProvider';
 import { ClickUpConfig } from '../types/config.types';
+import { Doc, DocContainer, DocPage, DocSummary } from '../types/doc.types';
 import {
   Board,
   CreateCommentInput,
@@ -57,6 +58,21 @@ interface ClickUpFolderResponse {
 
 interface ClickUpFolderlessListResponse {
   lists: { id: string; name: string }[];
+}
+
+interface ClickUpDocResponse {
+  id: string;
+  name: string;
+  date_created?: string;
+  date_updated?: string;
+}
+
+interface ClickUpDocPageResponse {
+  id: string;
+  name: string;
+  content?: string;
+  date_created?: string;
+  date_updated?: string;
 }
 
 export class ClickUpProvider extends BasePMToolProvider {
@@ -232,6 +248,16 @@ export class ClickUpProvider extends BasePMToolProvider {
     }, { ticketId, action: 'removeTaskFromList' });
   }
 
+  async searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]> {
+    return this.request(async () => {
+      const { data } = await this.http.get<{ tasks: ClickUpTaskResponse[] }>(
+        `/api/v2/list/${projectKeyOrListId}/task`,
+        { params: { archived: false, ...(status ? { 'statuses[]': status } : {}) } },
+      );
+      return data.tasks.map((t) => this.toTicket(t));
+    }, { action: 'searchTickets' });
+  }
+
   private toTicket(data: ClickUpTaskResponse): Ticket {
     return {
       id: data.id,
@@ -254,6 +280,68 @@ export class ClickUpProvider extends BasePMToolProvider {
       author: data.user.username,
       body: data.comment_text,
       createdAt: data.date,
+    };
+  }
+
+  async getWorkspaces(): Promise<DocContainer[]> {
+    return this.request(async () => {
+      const { data } = await this.http.get<ClickUpTeamResponse>('/api/v2/team');
+      return data.teams.map((t) => ({ id: t.id, name: t.name }));
+    }, { action: 'getWorkspaces' });
+  }
+
+  /** `containerId` is the ClickUp workspaceId — every Docs v3 endpoint is scoped to a workspace. */
+  async searchDocs(containerId: string): Promise<DocSummary[]> {
+    return this.request(async () => {
+      const { data } = await this.http.get<{ docs: ClickUpDocResponse[] }>(
+        `/api/v3/workspaces/${containerId}/docs`,
+      );
+      return data.docs.map((d) => this.toDocSummary(d));
+    }, { action: 'searchDocs' });
+  }
+
+  async getDoc(docId: string, containerId?: string): Promise<Doc> {
+    if (!containerId) {
+      throw new PMToolError(this.providerName, 'getDoc requires the workspaceId as containerId', 400);
+    }
+    return this.request(async () => {
+      const { data } = await this.http.get<ClickUpDocResponse>(
+        `/api/v3/workspaces/${containerId}/docs/${docId}`,
+      );
+      return this.toDocSummary(data);
+    }, { ticketId: docId, action: 'getDoc' });
+  }
+
+  async getDocPages(docId: string, containerId?: string): Promise<DocPage[]> {
+    if (!containerId) {
+      throw new PMToolError(this.providerName, 'getDocPages requires the workspaceId as containerId', 400);
+    }
+    return this.request(async () => {
+      const { data } = await this.http.get<ClickUpDocPageResponse[]>(
+        `/api/v3/workspaces/${containerId}/docs/${docId}/pages`,
+        { params: { content_format: 'text/md' } },
+      );
+      return data.map((p) => this.toDocPage(p));
+    }, { ticketId: docId, action: 'getDocPages' });
+  }
+
+  private toDocSummary(data: ClickUpDocResponse): Doc {
+    return {
+      id: data.id,
+      name: data.name,
+      createdAt: data.date_created,
+      updatedAt: data.date_updated,
+    };
+  }
+
+  private toDocPage(data: ClickUpDocPageResponse): DocPage {
+    return {
+      id: data.id,
+      title: data.name,
+      content: data.content ?? '',
+      createdAt: data.date_created,
+      updatedAt: data.date_updated,
+      raw: data,
     };
   }
 }

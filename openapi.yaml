@@ -143,6 +143,11 @@ tags:
       primary list. **ClickUp-only** — Jira has no equivalent concept since a
       Jira issue always belongs to exactly one project; calling these routes
       with `provider=jira` returns a 400.
+  - name: Docs
+    description: >-
+      Reading ClickUp Docs or Jira/Confluence pages — knowledge-base style
+      content alongside tickets. `containerId` means the ClickUp workspace
+      (team) ID for `clickup`, or the Confluence space key for `jira`.
 
 paths:
   /health:
@@ -782,6 +787,184 @@ paths:
         '500':
           $ref: '#/components/responses/ProviderError'
 
+  /api/{provider}/workspaces:
+    get:
+      tags: [Docs]
+      operationId: getWorkspaces
+      summary: 'ClickUp-only: list workspaces (teams)'
+      description: >-
+        Use to discover the `containerId` value needed by the `/docs`
+        routes for `provider=clickup`. Not supported by Jira — Confluence's
+        equivalent scoping value is a space key, which this API does not
+        currently have a discovery route for; ask the user for it directly.
+        Calling this with `provider=jira` returns a 400
+        `FeatureNotSupportedError`.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+      responses:
+        '200':
+          description: Workspaces (teams) available to the configured ClickUp credentials.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DocContainer'
+        '400':
+          description: Unsupported provider, or the feature is not supported by this provider (e.g. Jira).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/docs:
+    get:
+      tags: [Docs]
+      operationId: searchDocs
+      summary: List ClickUp Docs in a workspace, or Confluence pages in a Jira space
+      description: >-
+        Use for "what docs/pages exist", or as the discovery step before
+        `GET /api/{provider}/docs/{docId}` when you only know the workspace
+        or space, not a specific doc ID. Requires `containerId` — the ClickUp
+        workspace (team) ID for `provider=clickup`, or the Confluence space
+        key for `provider=jira`. If you don't already have the ClickUp
+        workspace ID, it is the `teams[].id` value from ClickUp's own `/team`
+        endpoint; this API does not currently expose a discovery route for it
+        (unlike ticket containers/boards).
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - name: containerId
+          in: query
+          required: true
+          schema:
+            type: string
+          description: ClickUp workspace (team) ID, or Confluence space key.
+      responses:
+        '200':
+          description: Docs/pages in the given workspace or space.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DocSummary'
+        '400':
+          description: Missing `containerId`, unsupported provider, or the feature is not supported by this provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/docs/{docId}:
+    get:
+      tags: [Docs]
+      operationId: getDocWithPages
+      summary: Get a doc/page AND its pages in one call (default "show me this doc" route)
+      description: >-
+        Same shape of tradeoff as the ticket-with-comments route: returns the
+        doc/page's own fields (including its own `content` for Confluence)
+        plus a `pages` array — the sub-pages that make up a ClickUp Doc, or
+        the child pages of a Confluence page. Prefer this over calling
+        `.../details` and `.../pages` separately.
+
+
+        For **ClickUp**, `containerId` (the workspace ID) is REQUIRED as a
+        query param — every ClickUp Docs v3 endpoint is workspace-scoped.
+        For **Jira**, `containerId` is not needed here (only for the
+        `/docs` search route).
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/DocIdParam'
+        - name: containerId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Required for ClickUp (workspace ID). Not used by Jira.
+      responses:
+        '200':
+          description: Doc/page with its pages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocWithPages'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/docs/{docId}/details:
+    get:
+      tags: [Docs]
+      operationId: getDoc
+      summary: Get a doc/page's own fields only, WITHOUT its pages
+      description: >-
+        Use when you don't need the sub-pages/child pages — e.g. just
+        checking a Confluence page's own body, or a ClickUp Doc's metadata.
+        ClickUp requires `containerId` (workspace ID) as a query param here.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/DocIdParam'
+        - name: containerId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Required for ClickUp (workspace ID). Not used by Jira.
+      responses:
+        '200':
+          description: Doc/page fields, no pages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Doc'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/docs/{docId}/pages:
+    get:
+      tags: [Docs]
+      operationId: getDocPages
+      summary: List the pages that make up a doc (ClickUp) or a page's child pages (Confluence)
+      description: >-
+        For **ClickUp**, returns every page inside the given Doc (this is
+        where the actual readable content lives — a ClickUp Doc itself has
+        no body of its own). `containerId` (workspace ID) is REQUIRED.
+
+
+        For **Jira/Confluence**, returns the child pages nested under the
+        given page. A page with no children returns an empty array — in
+        that case the content is on the page itself via
+        `GET /api/{provider}/docs/{docId}/details`.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/DocIdParam'
+        - name: containerId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Required for ClickUp (workspace ID). Not used by Jira.
+      responses:
+        '200':
+          description: Pages belonging to this doc/page.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DocPage'
+        '400':
+          $ref: '#/components/responses/BadProvider'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
 components:
   parameters:
     ProviderParam:
@@ -812,6 +995,16 @@ components:
           value: WEB-84
         clickup:
           value: 86a71dmab
+
+    DocIdParam:
+      name: docId
+      in: path
+      required: true
+      description: >-
+        The provider-native doc/page ID. For Jira/Confluence this is the
+        page's content ID. For ClickUp this is the Doc ID.
+      schema:
+        type: string
 
   responses:
     BadProvider:
@@ -1089,3 +1282,74 @@ components:
           type: string
           description: Currently unused by both providers (comment author is always the authenticated API user) — accepted for forward compatibility only.
       required: [body]
+
+    DocContainer:
+      type: object
+      description: A ClickUp workspace (team) — the value for `containerId` on the doc routes.
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+      required: [id, name]
+
+    DocSummary:
+      type: object
+      description: A ClickUp Doc or a Confluence page, listing shape only (no body content).
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+      required: [id, name]
+
+    Doc:
+      allOf:
+        - $ref: '#/components/schemas/DocSummary'
+        - type: object
+          properties:
+            content:
+              type: string
+              description: >-
+                The doc/page's own body. Present for Confluence (a page
+                always has a body). Usually absent for ClickUp, where a Doc
+                is just a container — its content lives in its pages instead.
+            raw:
+              description: Full, unmodified provider API response.
+
+    DocPage:
+      type: object
+      description: A single page within a ClickUp Doc, or a Confluence child page.
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        content:
+          type: string
+        url:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        raw:
+          description: Full, unmodified provider API response for this page.
+      required: [id, title, content]
+
+    DocWithPages:
+      allOf:
+        - $ref: '#/components/schemas/Doc'
+        - type: object
+          properties:
+            pages:
+              type: array
+              items:
+                $ref: '#/components/schemas/DocPage'
+          required: [pages]

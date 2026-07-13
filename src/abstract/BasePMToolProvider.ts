@@ -1,5 +1,6 @@
 import axios, { AxiosInstance, AxiosRequestConfig, isAxiosError } from 'axios';
 import { IPMToolProvider } from '../interfaces/IPMToolProvider';
+import { Doc, DocPage, DocWithPages } from '../types/doc.types';
 import {
   Board,
   CreateCommentInput,
@@ -12,7 +13,7 @@ import {
   UpdateTicketInput,
 } from '../types/ticket.types';
 import { PMUser } from '../types/user.types';
-import { PMToolError, TicketNotFoundError } from '../utils/errors';
+import { FeatureNotSupportedError, PMToolError, TicketNotFoundError } from '../utils/errors';
 
 /**
  * Shared behavior for every PM tool integration: HTTP client construction,
@@ -51,6 +52,28 @@ export abstract class BasePMToolProvider implements IPMToolProvider {
   abstract getContainers(): Promise<TicketContainer[]>;
   abstract getBoards(): Promise<Board[]>;
   abstract getUsers(query?: string): Promise<PMUser[]>;
+  abstract searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]>;
+
+  // Declared here (not abstract) so `this.getDoc`/`this.getDocPages` type-check
+  // in getDocWithPages below; subclasses that support docs override them.
+  getDoc?(docId: string, containerId?: string): Promise<Doc>;
+  getDocPages?(docId: string, containerId?: string): Promise<DocPage[]>;
+
+  /**
+   * Shared across providers: fetches a doc/page and its pages in parallel,
+   * same composition shape as getTicketWithComments. Providers only need to
+   * implement getDoc/getDocPages (or neither, if they don't support docs).
+   */
+  async getDocWithPages(docId: string, containerId?: string): Promise<DocWithPages> {
+    if (!this.getDoc || !this.getDocPages) {
+      throw new FeatureNotSupportedError(this.providerName, 'getDocWithPages');
+    }
+    const [doc, pages] = await Promise.all([
+      this.getDoc(docId, containerId),
+      this.getDocPages(docId, containerId),
+    ]);
+    return { ...doc, pages };
+  }
 
   /**
    * Wraps a provider call so any Axios failure surfaces as a PMToolError

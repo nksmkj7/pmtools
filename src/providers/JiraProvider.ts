@@ -1,5 +1,6 @@
 import { BasePMToolProvider } from '../abstract/BasePMToolProvider';
 import { JiraConfig } from '../types/config.types';
+import { Doc, DocPage, DocSummary } from '../types/doc.types';
 import {
   Board,
   CreateCommentInput,
@@ -41,6 +42,19 @@ interface JiraCommentResponse {
   body: JiraAdfDoc;
   created: string;
   updated: string;
+}
+
+interface ConfluencePageResponse {
+  id: string;
+  title: string;
+  body?: { storage?: { value: string } };
+  version?: { when?: string };
+  history?: { createdDate?: string };
+  _links?: { webui?: string; base?: string };
+}
+
+interface ConfluenceContentSearchResponse {
+  results: ConfluencePageResponse[];
 }
 
 export class JiraProvider extends BasePMToolProvider {
@@ -200,6 +214,29 @@ export class JiraProvider extends BasePMToolProvider {
     }, { action: 'getUsers' });
   }
 
+  async searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]> {
+    return this.request(async () => {
+      const jql = status
+        ? `project = "${projectKeyOrListId}" AND status = "${status}"`
+        : `project = "${projectKeyOrListId}"`;
+      const fields = 'summary,description,status,assignee,reporter,priority,created,updated';
+      const tickets: Ticket[] = [];
+      let nextPageToken: string | undefined;
+      let isLast = false;
+      while (!isLast) {
+        const { data } = await this.http.get<{
+          issues: JiraIssueResponse[];
+          nextPageToken?: string;
+          isLast: boolean;
+        }>('/rest/api/3/search/jql', { params: { jql, fields, maxResults: 50, nextPageToken } });
+        tickets.push(...data.issues.map((issue) => this.toTicket(issue)));
+        isLast = data.isLast;
+        nextPageToken = data.nextPageToken;
+      }
+      return tickets;
+    }, { action: 'searchTickets' });
+  }
+
   private toTicket(data: JiraIssueResponse): Ticket {
     return {
       id: data.id,
@@ -255,5 +292,58 @@ export class JiraProvider extends BasePMToolProvider {
     return doc.content
       .map((paragraph) => extract((paragraph as { content?: unknown[] }).content ?? []))
       .join('\n');
+  }
+
+  /** `containerId` is the Confluence space key. Confluence lives on the same Atlassian site as Jira, under /wiki. */
+  async searchDocs(containerId: string): Promise<DocSummary[]> {
+    return this.request(async () => {
+      const { data } = await this.http.get<ConfluenceContentSearchResponse>('/wiki/rest/api/content', {
+        params: { spaceKey: containerId, type: 'page', limit: 100, expand: 'version,history' },
+      });
+      return data.results.map((p) => this.toDoc(p));
+    }, { action: 'searchDocs' });
+  }
+
+  async getDoc(docId: string): Promise<Doc> {
+    return this.request(async () => {
+      const { data } = await this.http.get<ConfluencePageResponse>(`/wiki/rest/api/content/${docId}`, {
+        params: { expand: 'body.storage,version,history' },
+      });
+      return this.toDoc(data);
+    }, { ticketId: docId, action: 'getDoc' });
+  }
+
+  async getDocPages(docId: string): Promise<DocPage[]> {
+    return this.request(async () => {
+      const { data } = await this.http.get<ConfluenceContentSearchResponse>(
+        `/wiki/rest/api/content/${docId}/child/page`,
+        { params: { expand: 'body.storage,version,history', limit: 100 } },
+      );
+      return data.results.map((p) => this.toDocPage(p));
+    }, { ticketId: docId, action: 'getDocPages' });
+  }
+
+  private toDoc(data: ConfluencePageResponse): Doc {
+    return {
+      id: data.id,
+      name: data.title,
+      content: data.body?.storage?.value,
+      url: data._links?.base && data._links?.webui ? `${data._links.base}${data._links.webui}` : undefined,
+      createdAt: data.history?.createdDate,
+      updatedAt: data.version?.when,
+      raw: data,
+    };
+  }
+
+  private toDocPage(data: ConfluencePageResponse): DocPage {
+    return {
+      id: data.id,
+      title: data.title,
+      content: data.body?.storage?.value ?? '',
+      url: data._links?.base && data._links?.webui ? `${data._links.base}${data._links.webui}` : undefined,
+      createdAt: data.history?.createdDate,
+      updatedAt: data.version?.when,
+      raw: data,
+    };
   }
 }

@@ -1,3 +1,4 @@
+import { Doc, DocContainer, DocPage, DocSummary, DocWithPages } from '../types/doc.types';
 import {
   Board,
   CreateCommentInput,
@@ -35,8 +36,30 @@ export interface IPMToolProvider {
   /** Search assignable users by name/email — use to resolve an `id` for the `assignee` field. */
   getUsers(query?: string): Promise<PMUser[]>;
 
+  /** List tickets in a project (Jira) or list (ClickUp), optionally filtered by status name. */
+  searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]>;
+
   /** ClickUp-only: attach an existing task to an additional list without removing it from others. */
   addTaskToList?(ticketId: string, listId: string): Promise<Ticket>;
   /** ClickUp-only: detach a task from one of its additional lists. */
   removeTaskFromList?(ticketId: string, listId: string): Promise<void>;
+
+  /**
+   * Docs (ClickUp) / Confluence pages (Jira). Implemented separately per
+   * provider since the underlying APIs shape docs very differently, but
+   * both feed the same `getDocWithPages` composition below.
+   *
+   * `containerId` is the ClickUp workspaceId or the Confluence spaceKey.
+   * ClickUp additionally requires it on `getDoc`/`getDocPages` since every
+   * Docs v3 endpoint is scoped to a workspace.
+   */
+  searchDocs?(containerId: string): Promise<DocSummary[]>;
+  getDoc?(docId: string, containerId?: string): Promise<Doc>;
+  getDocPages?(docId: string, containerId?: string): Promise<DocPage[]>;
+
+  /** ClickUp-only: list workspaces (teams) — the values for `containerId` on the doc routes above. */
+  getWorkspaces?(): Promise<DocContainer[]>;
+
+  /** Composes getDoc + getDocPages — implemented once in BasePMToolProvider. */
+  getDocWithPages(docId: string, containerId?: string): Promise<DocWithPages>;
 }
