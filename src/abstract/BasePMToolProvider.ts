@@ -89,9 +89,13 @@ export abstract class BasePMToolProvider implements IPMToolProvider {
         if (status === 404 && context.ticketId) {
           throw new TicketNotFoundError(this.providerName, context.ticketId);
         }
+        const data = err.response?.data as
+          | { message?: string; errorMessages?: string[]; errors?: Record<string, string> }
+          | undefined;
         const message =
-          (err.response?.data as { message?: string; errorMessages?: string[] } | undefined)?.message ??
-          (err.response?.data as { errorMessages?: string[] } | undefined)?.errorMessages?.join(', ') ??
+          data?.message ||
+          data?.errorMessages?.join(', ') ||
+          (data?.errors && Object.keys(data.errors).length ? JSON.stringify(data.errors) : undefined) ||
           err.message;
         throw new PMToolError(this.providerName, `${context.action} failed: ${message}`, status, err);
       }
