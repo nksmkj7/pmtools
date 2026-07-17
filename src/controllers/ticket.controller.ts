@@ -118,12 +118,30 @@ export const ticketController = {
 
   async searchTickets(req: Request, res: Response, next: NextFunction) {
     try {
-      const { projectKeyOrListId, status } = req.query as { projectKeyOrListId?: string; status?: string };
+      const { projectKeyOrListId, status, assignee } = req.query as {
+        projectKeyOrListId?: string;
+        status?: string;
+        assignee?: string;
+      };
       if (!projectKeyOrListId) {
         res.status(400).json({ message: 'projectKeyOrListId query param is required' });
         return;
       }
-      const tickets = await getProvider(req).searchTickets(projectKeyOrListId, status);
+      const tickets = await getProvider(req).searchTickets(projectKeyOrListId, status, assignee);
+      res.json(tickets);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async searchTicketsAssignedToUser(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { assignee, containerId } = req.query as { assignee?: string; containerId?: string };
+      if (!assignee) {
+        res.status(400).json({ message: 'assignee query param is required' });
+        return;
+      }
+      const tickets = await getProvider(req).searchTicketsAssignedToUser(assignee, containerId);
       res.json(tickets);
     } catch (err) {
       next(err);
@@ -213,6 +231,25 @@ export const ticketController = {
     }
   },
 
+  async createDoc(req: Request, res: Response, next: NextFunction) {
+    try {
+      const provider = getProvider(req);
+      const { containerId, name, content } = req.body as {
+        containerId?: string;
+        name?: string;
+        content?: string;
+      };
+      if (!containerId || !name) {
+        res.status(400).json({ message: 'containerId and name are required' });
+        return;
+      }
+      const doc = await provider.createDocWithContent(containerId, { name, content });
+      res.status(201).json(doc);
+    } catch (err) {
+      next(err);
+    }
+  },
+
   async getDocWithPages(req: Request, res: Response, next: NextFunction) {
     try {
       const doc = await getProvider(req).getDocWithPages(
@@ -220,6 +257,51 @@ export const ticketController = {
         req.query.containerId as string | undefined,
       );
       res.json(doc);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async updateDocPage(req: Request, res: Response, next: NextFunction) {
+    try {
+      const provider = getProvider(req);
+      if (!provider.updateDocPage) {
+        throw new FeatureNotSupportedError(provider.providerName, 'updateDocPage');
+      }
+      const { content, name } = req.body as { content?: string; name?: string };
+      if (!content) {
+        res.status(400).json({ message: 'content is required' });
+        return;
+      }
+      const page = await provider.updateDocPage(
+        req.params.docId,
+        req.params.pageId,
+        { content, name },
+        req.query.containerId as string | undefined,
+      );
+      res.json(page);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async uploadAttachment(req: Request, res: Response, next: NextFunction) {
+    try {
+      const provider = getProvider(req);
+      if (!provider.uploadAttachment) {
+        throw new FeatureNotSupportedError(provider.providerName, 'uploadAttachment');
+      }
+      const { filename, mimeType, contentBase64 } = req.body as {
+        filename?: string;
+        mimeType?: string;
+        contentBase64?: string;
+      };
+      if (!filename || !mimeType || !contentBase64) {
+        res.status(400).json({ message: 'filename, mimeType, and contentBase64 are required' });
+        return;
+      }
+      const attachment = await provider.uploadAttachment(req.params.ticketId, { filename, mimeType, contentBase64 });
+      res.status(201).json(attachment);
     } catch (err) {
       next(err);
     }

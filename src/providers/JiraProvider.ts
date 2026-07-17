@@ -1,4 +1,5 @@
 import { BasePMToolProvider } from '../abstract/BasePMToolProvider';
+import { Attachment, UploadAttachmentInput } from '../types/attachment.types';
 import { JiraConfig } from '../types/config.types';
 import { Doc, DocPage, DocSummary } from '../types/doc.types';
 import {
@@ -214,11 +215,12 @@ export class JiraProvider extends BasePMToolProvider {
     }, { action: 'getUsers' });
   }
 
-  async searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]> {
+  async searchTickets(projectKeyOrListId: string, status?: string, assignee?: string): Promise<Ticket[]> {
     return this.request(async () => {
-      const jql = status
-        ? `project = "${projectKeyOrListId}" AND status = "${status}"`
-        : `project = "${projectKeyOrListId}"`;
+      const clauses = [`project = "${projectKeyOrListId}"`];
+      if (status) clauses.push(`status = "${status}"`);
+      if (assignee) clauses.push(`assignee = "${assignee}"`);
+      const jql = `${clauses.join(' AND ')} ORDER BY updated DESC`;
       const fields = 'summary,description,status,assignee,reporter,priority,created,updated';
       const tickets: Ticket[] = [];
       let nextPageToken: string | undefined;
@@ -235,6 +237,27 @@ export class JiraProvider extends BasePMToolProvider {
       }
       return tickets;
     }, { action: 'searchTickets' });
+  }
+
+  async searchTicketsAssignedToUser(assignee: string): Promise<Ticket[]> {
+    return this.request(async () => {
+      const jql = `assignee = "${assignee}" ORDER BY updated DESC`;
+      const fields = 'summary,description,status,assignee,reporter,priority,created,updated';
+      const tickets: Ticket[] = [];
+      let nextPageToken: string | undefined;
+      let isLast = false;
+      while (!isLast) {
+        const { data } = await this.http.get<{
+          issues: JiraIssueResponse[];
+          nextPageToken?: string;
+          isLast: boolean;
+        }>('/rest/api/3/search/jql', { params: { jql, fields, maxResults: 50, nextPageToken } });
+        tickets.push(...data.issues.map((issue) => this.toTicket(issue)));
+        isLast = data.isLast;
+        nextPageToken = data.nextPageToken;
+      }
+      return tickets;
+    }, { action: 'searchTicketsAssignedToUser' });
   }
 
   private toTicket(data: JiraIssueResponse): Ticket {
@@ -345,5 +368,31 @@ export class JiraProvider extends BasePMToolProvider {
       updatedAt: data.version?.when,
       raw: data,
     };
+  }
+
+  async uploadAttachment(ticketId: string, input: UploadAttachmentInput): Promise<Attachment> {
+    return this.request(async () => {
+      const bytes = Buffer.from(input.contentBase64, 'base64');
+      const form = new FormData();
+      form.append('file', new Blob([bytes], { type: input.mimeType }), input.filename);
+
+      const auth = this.http.defaults.auth as { username: string; password: string } | undefined;
+      const basicAuth = auth ? Buffer.from(`${auth.username}:${auth.password}`).toString('base64') : undefined;
+      const response = await fetch(`${this.http.defaults.baseURL}/rest/api/3/issue/${ticketId}/attachments`, {
+        method: 'POST',
+        headers: {
+          'X-Atlassian-Token': 'no-check',
+          ...(basicAuth ? { Authorization: `Basic ${basicAuth}` } : {}),
+        },
+        body: form,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new PMToolError(this.providerName, `uploadAttachment failed: ${text}`, response.status);
+      }
+      const data = (await response.json()) as { id: string; content: string }[];
+      const attachment = data[0];
+      return { id: attachment.id, url: attachment.content };
+    }, { ticketId, action: 'uploadAttachment' });
   }
 }

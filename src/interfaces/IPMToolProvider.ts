@@ -1,4 +1,5 @@
-import { Doc, DocContainer, DocPage, DocSummary, DocWithPages } from '../types/doc.types';
+import { Attachment, UploadAttachmentInput } from '../types/attachment.types';
+import { CreateDocInput, CreateDocPageInput, Doc, DocContainer, DocPage, DocSummary, DocWithPages } from '../types/doc.types';
 import {
   Board,
   CreateCommentInput,
@@ -36,8 +37,23 @@ export interface IPMToolProvider {
   /** Search assignable users by name/email — use to resolve an `id` for the `assignee` field. */
   getUsers(query?: string): Promise<PMUser[]>;
 
-  /** List tickets in a project (Jira) or list (ClickUp), optionally filtered by status name. */
-  searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]>;
+  /**
+   * List tickets in a project (Jira) or list (ClickUp), optionally filtered by
+   * status name and/or assignee (Jira account ID, or ClickUp numeric user ID
+   * as a string — resolve via `getUsers` first). Results are ordered most
+   * recently updated first.
+   */
+  searchTickets(projectKeyOrListId: string, status?: string, assignee?: string): Promise<Ticket[]>;
+
+  /**
+   * List tickets assigned to a user across the ENTIRE workspace, not scoped
+   * to a single project/list — use for "what's assigned to me/user X"
+   * requests where no specific project/list was named. Jira runs a
+   * cross-project JQL search; ClickUp requires `containerId` (the workspace
+   * ID from `getWorkspaces`) since its team-scoped task search is
+   * workspace-bound.
+   */
+  searchTicketsAssignedToUser(assignee: string, containerId?: string): Promise<Ticket[]>;
 
   /** ClickUp-only: attach an existing task to an additional list without removing it from others. */
   addTaskToList?(ticketId: string, listId: string): Promise<Ticket>;
@@ -62,4 +78,38 @@ export interface IPMToolProvider {
 
   /** Composes getDoc + getDocPages — implemented once in BasePMToolProvider. */
   getDocWithPages(docId: string, containerId?: string): Promise<DocWithPages>;
+
+  /**
+   * Creates a new Doc container (ClickUp) / top-level page (Confluence).
+   * `containerId` is the ClickUp workspaceId or the Confluence spaceKey.
+   */
+  createDoc?(containerId: string, input: CreateDocInput): Promise<Doc>;
+  /** Adds a page with content to an existing doc. ClickUp-only in the current implementation. */
+  createDocPage?(docId: string, input: CreateDocPageInput, containerId?: string): Promise<DocPage>;
+
+  /**
+   * Composes createDoc + createDocPage — implemented once in
+   * BasePMToolProvider. Creates the doc, then (if `content` is given) adds a
+   * single page with that content, so callers can publish markdown content
+   * as a new doc in one call instead of two.
+   */
+  createDocWithContent(
+    containerId: string,
+    input: CreateDocInput & { content?: string },
+  ): Promise<DocWithPages>;
+
+  /**
+   * Uploads a file to a ticket, returning a durable URL (e.g. to then embed
+   * as a markdown image in a doc page's content, since neither provider
+   * exposes a doc/page-scoped upload route).
+   */
+  uploadAttachment?(ticketId: string, input: UploadAttachmentInput): Promise<Attachment>;
+
+  /** ClickUp-only: overwrite an existing doc page's content. */
+  updateDocPage?(
+    docId: string,
+    pageId: string,
+    input: { content: string; name?: string },
+    containerId?: string,
+  ): Promise<DocPage>;
 }

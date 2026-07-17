@@ -347,6 +347,55 @@ paths:
           $ref: '#/components/responses/ProviderError'
 
   /api/{provider}/tickets:
+    get:
+      tags: [Tickets]
+      operationId: searchTickets
+      summary: List/search tickets in a project or list, optionally filtered by status and/or assignee
+      description: >-
+        Use for "what tickets are in project X", "show open tickets in list
+        Y", or "what's the most recent task assigned to user Z" — pass
+        `assignee` (resolve the `id` via `GET /api/{provider}/users` first;
+        never guess it) to filter to one person's tickets. Results are
+        ordered most recently updated first, so the first item in the
+        response is the most recent one.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - name: projectKeyOrListId
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Jira project key or ClickUp list ID to search within.
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to tickets in this status name.
+        - name: assignee
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Jira account ID, or ClickUp numeric user ID (as a string). Resolve via `GET /api/{provider}/users`.
+      responses:
+        '200':
+          description: Tickets matching the filters, most recently updated first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Ticket'
+        '400':
+          description: Missing `projectKeyOrListId` query param, or unsupported provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
     post:
       tags: [Tickets]
       operationId: createTicket
@@ -408,6 +457,54 @@ paths:
             Missing/invalid `projectKeyOrListId`, unsupported provider, or the
             underlying tool rejected the payload (e.g. unknown project key,
             unknown list ID, or invalid priority value for that provider).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/tickets/assigned:
+    get:
+      tags: [Tickets]
+      operationId: searchTicketsAssignedToUser
+      summary: List tickets assigned to a user across the entire workspace (not scoped to one project/list)
+      description: >-
+        Use for "list all tasks assigned to <person>" or "what's on my plate"
+        when the user hasn't named a specific project/list — unlike
+        `GET /api/{provider}/tickets`, this searches every project/list at
+        once. Pass `assignee` (resolve the `id` via
+        `GET /api/{provider}/users` first; never guess it). For **ClickUp**,
+        `containerId` (the workspace/team ID from
+        `GET /api/{provider}/workspaces`) is REQUIRED, since ClickUp's
+        cross-list task search is workspace-scoped. Jira ignores
+        `containerId` since JQL can search across all projects directly.
+        Results are ordered most recently updated first.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - name: assignee
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Jira account ID, or ClickUp numeric user ID (as a string). Resolve via `GET /api/{provider}/users`.
+        - name: containerId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Required for ClickUp (workspace/team ID from `GET /api/{provider}/workspaces`). Not used by Jira.
+      responses:
+        '200':
+          description: Tickets assigned to the user, most recently updated first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Ticket'
+        '400':
+          description: Missing `assignee` query param (or missing `containerId` for ClickUp), or unsupported provider.
           content:
             application/json:
               schema:
@@ -787,6 +884,56 @@ paths:
         '500':
           $ref: '#/components/responses/ProviderError'
 
+  /api/{provider}/tickets/{ticketId}/attachments:
+    post:
+      tags: [Tickets]
+      operationId: uploadAttachment
+      summary: Upload a file to a ticket, returning its durable URL
+      description: >-
+        Uploads a base64-encoded file as an attachment on the ticket and
+        returns the provider's public URL for it. Useful as a building block
+        to embed images in a doc page's markdown content (`![alt](url)`),
+        since neither provider exposes a doc/page-scoped upload route —
+        ClickUp uses its v2 task-attachment endpoint under the hood, Jira
+        uses the issue attachments endpoint.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/TicketIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename, mimeType, contentBase64]
+              properties:
+                filename:
+                  type: string
+                  example: flow-diagram.png
+                mimeType:
+                  type: string
+                  example: image/png
+                contentBase64:
+                  type: string
+                  description: Raw file bytes, base64-encoded.
+      responses:
+        '201':
+          description: The uploaded attachment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Attachment'
+        '400':
+          description: Missing required fields, or the feature is not supported by this provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
   /api/{provider}/workspaces:
     get:
       tags: [Docs]
@@ -852,6 +999,60 @@ paths:
                   $ref: '#/components/schemas/DocSummary'
         '400':
           description: Missing `containerId`, unsupported provider, or the feature is not supported by this provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+    post:
+      tags: [Docs]
+      operationId: createDoc
+      summary: Create a new doc (ClickUp) and optionally publish content into it in one call
+      description: >-
+        Use for "publish this as a doc in ClickUp"/"create a doc with this
+        content" requests. Creates a new Doc named `name` in the given
+        `containerId` (ClickUp workspace ID); if `content` is provided, also
+        adds a single page to that doc containing it (markdown by default).
+        Jira/Confluence is not implemented for this route yet — calling it
+        with `provider=jira` returns a 400 `FeatureNotSupportedError`.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [containerId, name]
+              properties:
+                containerId:
+                  type: string
+                  description: ClickUp workspace (team) ID. Get valid values from `GET /api/{provider}/workspaces`.
+                name:
+                  type: string
+                  description: Doc title.
+                content:
+                  type: string
+                  description: >-
+                    Optional page content (markdown) to publish immediately.
+                    If omitted, an empty doc with no pages is created.
+            examples:
+              clickup:
+                summary: Publish a markdown doc to ClickUp
+                value:
+                  containerId: '9013608825'
+                  name: createModuleRouter — Technical Reference
+                  content: '# createModuleRouter\n\n...'
+      responses:
+        '201':
+          description: The created doc, with its one page if `content` was given.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocWithPages'
+        '400':
+          description: Missing `containerId`/`name`, unsupported provider, or the feature is not supported by this provider (e.g. Jira).
           content:
             application/json:
               schema:
@@ -962,6 +1163,64 @@ paths:
                   $ref: '#/components/schemas/DocPage'
         '400':
           $ref: '#/components/responses/BadProvider'
+        '500':
+          $ref: '#/components/responses/ProviderError'
+
+  /api/{provider}/docs/{docId}/pages/{pageId}:
+    patch:
+      tags: [Docs]
+      operationId: updateDocPage
+      summary: 'ClickUp-only: overwrite an existing doc page''s content'
+      description: >-
+        Replaces the page's content wholesale (e.g. to swap Mermaid code
+        fences for real embedded images once uploaded via
+        `POST /api/{provider}/tickets/{ticketId}/attachments`, since ClickUp
+        Docs don't render Mermaid). Not supported by Jira; calling this with
+        `provider=jira` returns a 400 `FeatureNotSupportedError`.
+      parameters:
+        - $ref: '#/components/parameters/ProviderParam'
+        - $ref: '#/components/parameters/DocIdParam'
+        - name: pageId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The ClickUp page ID (a Doc's `pages[].id`).
+        - name: containerId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Required for ClickUp (workspace ID).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  description: New page content (markdown by default), replacing the old content entirely.
+                name:
+                  type: string
+                  description: Optional new page title.
+      responses:
+        '200':
+          description: The updated page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocPage'
+        '400':
+          description: Missing `content`, or the feature is not supported by this provider (e.g. Jira).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
         '500':
           $ref: '#/components/responses/ProviderError'
 
@@ -1353,3 +1612,13 @@ components:
               items:
                 $ref: '#/components/schemas/DocPage'
           required: [pages]
+
+    Attachment:
+      type: object
+      description: A file uploaded to a ticket, with its durable provider URL.
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+      required: [url]

@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosRequestConfig, isAxiosError } from 'axios';
 import { IPMToolProvider } from '../interfaces/IPMToolProvider';
-import { Doc, DocPage, DocWithPages } from '../types/doc.types';
+import { Attachment, UploadAttachmentInput } from '../types/attachment.types';
+import { CreateDocInput, CreateDocPageInput, Doc, DocPage, DocWithPages } from '../types/doc.types';
 import {
   Board,
   CreateCommentInput,
@@ -52,12 +53,22 @@ export abstract class BasePMToolProvider implements IPMToolProvider {
   abstract getContainers(): Promise<TicketContainer[]>;
   abstract getBoards(): Promise<Board[]>;
   abstract getUsers(query?: string): Promise<PMUser[]>;
-  abstract searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]>;
+  abstract searchTickets(projectKeyOrListId: string, status?: string, assignee?: string): Promise<Ticket[]>;
+  abstract searchTicketsAssignedToUser(assignee: string, containerId?: string): Promise<Ticket[]>;
 
   // Declared here (not abstract) so `this.getDoc`/`this.getDocPages` type-check
   // in getDocWithPages below; subclasses that support docs override them.
   getDoc?(docId: string, containerId?: string): Promise<Doc>;
   getDocPages?(docId: string, containerId?: string): Promise<DocPage[]>;
+  createDoc?(containerId: string, input: CreateDocInput): Promise<Doc>;
+  createDocPage?(docId: string, input: CreateDocPageInput, containerId?: string): Promise<DocPage>;
+  uploadAttachment?(ticketId: string, input: UploadAttachmentInput): Promise<Attachment>;
+  updateDocPage?(
+    docId: string,
+    pageId: string,
+    input: { content: string; name?: string },
+    containerId?: string,
+  ): Promise<DocPage>;
 
   /**
    * Shared across providers: fetches a doc/page and its pages in parallel,
@@ -73,6 +84,29 @@ export abstract class BasePMToolProvider implements IPMToolProvider {
       this.getDocPages(docId, containerId),
     ]);
     return { ...doc, pages };
+  }
+
+  /**
+   * Shared across providers: creates the doc, then (if content is given)
+   * adds a single page with that content — one call to publish markdown
+   * content as a brand-new doc, instead of createDoc + createDocPage.
+   */
+  async createDocWithContent(
+    containerId: string,
+    input: CreateDocInput & { content?: string },
+  ): Promise<DocWithPages> {
+    if (!this.createDoc) {
+      throw new FeatureNotSupportedError(this.providerName, 'createDocWithContent');
+    }
+    const doc = await this.createDoc(containerId, { name: input.name });
+    if (!input.content) {
+      return { ...doc, pages: [] };
+    }
+    if (!this.createDocPage) {
+      throw new FeatureNotSupportedError(this.providerName, 'createDocPage');
+    }
+    const page = await this.createDocPage(doc.id, { name: input.name, content: input.content }, containerId);
+    return { ...doc, pages: [page] };
   }
 
   /**

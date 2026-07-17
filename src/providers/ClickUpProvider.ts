@@ -1,6 +1,7 @@
 import { BasePMToolProvider } from '../abstract/BasePMToolProvider';
+import { Attachment, UploadAttachmentInput } from '../types/attachment.types';
 import { ClickUpConfig } from '../types/config.types';
-import { Doc, DocContainer, DocPage, DocSummary } from '../types/doc.types';
+import { CreateDocInput, CreateDocPageInput, Doc, DocContainer, DocPage, DocSummary } from '../types/doc.types';
 import {
   Board,
   CreateCommentInput,
@@ -75,6 +76,11 @@ interface ClickUpDocPageResponse {
   date_updated?: string;
 }
 
+interface ClickUpAttachmentResponse {
+  id: string;
+  url: string;
+}
+
 export class ClickUpProvider extends BasePMToolProvider {
   readonly providerName = 'clickup';
 
@@ -119,6 +125,7 @@ export class ClickUpProvider extends BasePMToolProvider {
           ...(input.status ? { status: input.status } : {}),
           ...(input.priority ? { priority: input.priority } : {}),
           ...(input.parentId ? { parent: input.parentId } : {}),
+          ...(input.assignee ? { assignees: [Number(input.assignee)] } : {}),
         },
       );
       return this.toTicket(data);
@@ -131,6 +138,7 @@ export class ClickUpProvider extends BasePMToolProvider {
         ...(input.title ? { name: input.title } : {}),
         ...(input.description ? { description: input.description } : {}),
         ...(input.priority ? { priority: input.priority } : {}),
+        ...(input.assignee ? { assignees: { add: [Number(input.assignee)], rem: [] } } : {}),
       });
       return this.toTicket(data);
     }, { ticketId, action: 'updateTicket' });
@@ -229,7 +237,7 @@ export class ClickUpProvider extends BasePMToolProvider {
       );
       const q = query?.toLowerCase();
       return q
-        ? users.filter((u) => u.name.toLowerCase().includes(q) || u.email?.toLowerCase().includes(q))
+        ? users.filter((u) => u.name?.toLowerCase().includes(q) || u.email?.toLowerCase().includes(q))
         : users;
     }, { action: 'getUsers' });
   }
@@ -248,14 +256,55 @@ export class ClickUpProvider extends BasePMToolProvider {
     }, { ticketId, action: 'removeTaskFromList' });
   }
 
-  async searchTickets(projectKeyOrListId: string, status?: string): Promise<Ticket[]> {
+  async searchTickets(projectKeyOrListId: string, status?: string, assignee?: string): Promise<Ticket[]> {
     return this.request(async () => {
       const { data } = await this.http.get<{ tasks: ClickUpTaskResponse[] }>(
         `/api/v2/list/${projectKeyOrListId}/task`,
-        { params: { archived: false, ...(status ? { 'statuses[]': status } : {}) } },
+        {
+          params: {
+            archived: false,
+            order_by: 'updated',
+            reverse: true,
+            ...(status ? { 'statuses[]': status } : {}),
+            ...(assignee ? { 'assignees[]': assignee } : {}),
+          },
+        },
       );
       return data.tasks.map((t) => this.toTicket(t));
     }, { action: 'searchTickets' });
+  }
+
+  async searchTicketsAssignedToUser(assignee: string, containerId?: string): Promise<Ticket[]> {
+    if (!containerId) {
+      throw new PMToolError(
+        this.providerName,
+        'searchTicketsAssignedToUser requires the workspace (team) ID as containerId — resolve via getWorkspaces',
+        400,
+      );
+    }
+    return this.request(async () => {
+      const tickets: Ticket[] = [];
+      let page = 0;
+      let lastPage = false;
+      while (!lastPage) {
+        const { data } = await this.http.get<{ tasks: ClickUpTaskResponse[]; last_page: boolean }>(
+          `/api/v2/team/${containerId}/task`,
+          {
+            params: {
+              archived: false,
+              order_by: 'updated',
+              reverse: true,
+              'assignees[]': assignee,
+              page,
+            },
+          },
+        );
+        tickets.push(...data.tasks.map((t) => this.toTicket(t)));
+        lastPage = data.last_page;
+        page += 1;
+      }
+      return tickets;
+    }, { action: 'searchTicketsAssignedToUser' });
   }
 
   private toTicket(data: ClickUpTaskResponse): Ticket {
@@ -323,6 +372,85 @@ export class ClickUpProvider extends BasePMToolProvider {
       );
       return data.map((p) => this.toDocPage(p));
     }, { ticketId: docId, action: 'getDocPages' });
+  }
+
+  async createDoc(containerId: string, input: CreateDocInput): Promise<Doc> {
+    return this.request(async () => {
+      const { data } = await this.http.post<ClickUpDocResponse>(
+        `/api/v3/workspaces/${containerId}/docs`,
+        { name: input.name },
+      );
+      return this.toDocSummary(data);
+    }, { action: 'createDoc' });
+  }
+
+  async createDocPage(docId: string, input: CreateDocPageInput, containerId?: string): Promise<DocPage> {
+    if (!containerId) {
+      throw new PMToolError(this.providerName, 'createDocPage requires the workspaceId as containerId', 400);
+    }
+    return this.request(async () => {
+      const { data } = await this.http.post<ClickUpDocPageResponse>(
+        `/api/v3/workspaces/${containerId}/docs/${docId}/pages`,
+        {
+          name: input.name,
+          content: input.content,
+          content_format: input.contentFormat ?? 'text/md',
+        },
+      );
+      return this.toDocPage(data);
+    }, { ticketId: docId, action: 'createDocPage' });
+  }
+
+  async updateDocPage(
+    docId: string,
+    pageId: string,
+    input: { content: string; name?: string },
+    containerId?: string,
+  ): Promise<DocPage> {
+    if (!containerId) {
+      throw new PMToolError(this.providerName, 'updateDocPage requires the workspaceId as containerId', 400);
+    }
+    return this.request(async () => {
+      await this.http.put(
+        `/api/v3/workspaces/${containerId}/docs/${docId}/pages/${pageId}`,
+        {
+          content: input.content,
+          content_edit_mode: 'replace',
+          ...(input.name ? { name: input.name } : {}),
+        },
+      );
+      const { data } = await this.http.get<ClickUpDocPageResponse>(
+        `/api/v3/workspaces/${containerId}/docs/${docId}/pages/${pageId}`,
+        { params: { content_format: 'text/md' } },
+      );
+      return this.toDocPage(data);
+    }, { ticketId: pageId, action: 'updateDocPage' });
+  }
+
+  /**
+   * ClickUp's Docs v3 API has no doc/page-scoped file upload, so this reuses
+   * the v2 task-attachment endpoint to get a durable CDN URL — the only way
+   * to embed a real image in a doc page's markdown content.
+   */
+  async uploadAttachment(ticketId: string, input: UploadAttachmentInput): Promise<Attachment> {
+    return this.request(async () => {
+      const bytes = Buffer.from(input.contentBase64, 'base64');
+      const form = new FormData();
+      form.append('attachment', new Blob([bytes], { type: input.mimeType }), input.filename);
+
+      const authHeader = this.http.defaults.headers.Authorization as string;
+      const response = await fetch(`${this.http.defaults.baseURL}/api/v2/task/${ticketId}/attachment`, {
+        method: 'POST',
+        headers: { Authorization: authHeader },
+        body: form,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new PMToolError(this.providerName, `uploadAttachment failed: ${text}`, response.status);
+      }
+      const data = (await response.json()) as ClickUpAttachmentResponse;
+      return { id: data.id, url: data.url };
+    }, { ticketId, action: 'uploadAttachment' });
   }
 
   private toDocSummary(data: ClickUpDocResponse): Doc {

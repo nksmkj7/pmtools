@@ -35,3 +35,14 @@ export interface DocPage {
 export interface DocWithPages extends Doc {
   pages: DocPage[];
 }
+
+export interface CreateDocInput {
+  name: string;
+}
+
+export interface CreateDocPageInput {
+  name: string;
+  content: string;
+  /** ClickUp: "text/md" (default) or "text/plain". Ignored by providers that don't support it. */
+  contentFormat?: string;
+}
